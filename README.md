@@ -1,0 +1,3 @@
+# OmniTrainer: Multimodal Customer Service Trainer
+
+This project holds a customer service trainer. It'll use various agents which will evaluate the customer service agent's performance. To get started, we should have an `.env` configured correctly. There's an `env.example` in the root of the repository. You need to configure the gemini endpoint, as well as the api key. The details are defined in the `env.example`.
