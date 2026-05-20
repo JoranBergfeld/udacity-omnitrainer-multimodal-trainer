@@ -20,6 +20,7 @@ import os
 import requests
 import gradio as gr
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Any
 from pydantic_ai.messages import BinaryContent
@@ -150,6 +151,21 @@ def _call_media_moderation(media: str, span: trace.Span) -> Tuple[dict[str, Any]
     return result, feedback, content_type, mime_type
 
 
+def _emit_feedback_span(feedback: str, *, flagged: bool, content_type: str | None = None) -> None:
+    """
+    Emit a child "feedback" span recording what the trainee saw this turn.
+
+    Created on every terminal path of a chat turn (flagged or safe) so the
+    Phoenix trace always has a feedback record, not only when content is blocked.
+    Must be called inside an active "chat_turn" span so it nests correctly.
+    """
+    with tracer.start_as_current_span("feedback") as feedback_span:
+        feedback_span.set_attribute("feedback", feedback)
+        feedback_span.set_attribute("flagged", flagged)
+        if content_type:
+            feedback_span.set_attribute("content_type", content_type)
+
+
 def check_content_safety(*, text: str | None = None, media: str | None = None) -> Tuple[bool, str, str]:
     """
     Check if content is safe by calling the moderation backend.
@@ -194,6 +210,87 @@ def check_content_safety(*, text: str | None = None, media: str | None = None) -
     return True, feedback, mime_type
 
 
+BLOCKED_RESPONSE = "[This content was flagged by moderation and not sent to the AI. Please try again.]"
+
+
+@dataclass
+class _ModerationOutcome:
+    """Result of moderating one chat turn's user input.
+
+    If ``blocked_feedback`` is set, the turn must be blocked and no agent call
+    should be made. Otherwise ``prompt_parts`` is the assembled prompt to forward
+    to the customer agent and ``safety_message`` is the last moderation rationale.
+    """
+
+    prompt_parts: List[str | BinaryContent] = field(default_factory=list)
+    safety_message: str = ""
+    blocked_feedback: str | None = None
+    blocked_content_type: str | None = None
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.blocked_feedback is not None
+
+
+def _moderate_turn_content(message: dict) -> _ModerationOutcome:
+    """Moderate every text/file in ``message``; return the assembled prompt or a block reason.
+
+    Stops at the first flagged item (text is checked before files) so the trainee
+    gets feedback on the first violation rather than the last.
+    """
+    outcome = _ModerationOutcome(
+        prompt_parts=["This is the next message from the support agent:"]
+    )
+
+    text = message.get("text")
+    if text:
+        is_safe, outcome.safety_message, _ = check_content_safety(text=text)
+        if not is_safe:
+            outcome.blocked_feedback = f"⚠️ Content flagged: {outcome.safety_message}"
+            outcome.blocked_content_type = "text"
+            return outcome
+        outcome.prompt_parts.append(text)
+
+    for file_path in message.get("files") or []:
+        try:
+            is_safe, outcome.safety_message, mime_type = check_content_safety(media=file_path)
+        except ValueError as e:
+            # File-too-large or similar input errors surface directly to the UI
+            raise gr.Error(str(e))
+
+        if not is_safe:
+            outcome.blocked_feedback = f"⚠️ Content flagged: {outcome.safety_message}"
+            # Derive content_type from mime_type (e.g. "image" from "image/png")
+            outcome.blocked_content_type = mime_type.split("/")[0] if mime_type else None
+            return outcome
+
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        outcome.prompt_parts.append(BinaryContent(data=file_bytes, media_type=mime_type))
+
+    return outcome
+
+
+async def _run_customer_agent(
+    prompt_parts: List[str | BinaryContent], past_messages: List
+) -> Tuple[str, List]:
+    """Send moderated content to the customer-role agent inside its own span."""
+    try:
+        with tracer.start_as_current_span("llm_customer"):
+            # GEMINI CALL: agent that role-plays the unhappy ACME customer
+            result = await customer_agent.run(prompt_parts, message_history=past_messages)
+
+        logger.info(f"Response generated ({len(result.all_messages())} messages in history)")
+        return result.output, result.all_messages()
+
+    except Exception as e:
+        logger.error(f"Error in chat_with_gemini: {str(e)}")
+        raise gr.Error(
+            "I'm sorry, but I encountered an error while processing your request. "
+            "Please try again or contact ACME support if the issue persists."
+        )
+
+
 class ChatSessionWithTracing:
     """
     Manages a chat session with tracing support.
@@ -228,96 +325,42 @@ class ChatSessionWithTracing:
         Returns:
             Tuple of (response_text, updated_messages, feedback_text)
         """
-        # Create a tracing span for this chat turn
-
         with tracer.start_as_current_span(
             "chat_turn",
             context=trace.set_span_in_context(self.conversation_span),
-        ) as span:
-            
-            logger.info(f"New turn - Text: '{message.get('text', '')[:50]}...', Files: {len(message.get('files', []))}")
+        ):
+            logger.info(
+                f"New turn - Text: '{message.get('text', '')[:50]}...', "
+                f"Files: {len(message.get('files', []))}"
+            )
 
-            # Build prompt for the AI customer (includes text and media)
-            prompt_parts: List[str | BinaryContent] = [
-                "This is the next message from the support agent:",
-            ]
+            # 1. Moderate every text/file in the incoming message.
+            outcome = _moderate_turn_content(message)
 
-            # Initialize safety message to empty string, will be set if content is flagged
-            safety_message = ""
+            # 2. Block and bail if anything was flagged.
+            if outcome.is_blocked:
+                _emit_feedback_span(
+                    outcome.blocked_feedback,
+                    flagged=True,
+                    content_type=outcome.blocked_content_type,
+                )
+                return BLOCKED_RESPONSE, past_messages, outcome.blocked_feedback
 
-            # Process each part of the message
-            for key, value in message.items():
-
-                # MODERATION STEP 1: Check text content
-                if key == "text" and value:
-
-                    # Call moderation backend (FastAPI service)
-                    is_safe, safety_message, mime_type = check_content_safety(text=value)
-
-                    if not is_safe:
-                        # Content flagged - block and return error
-                        feedback = f"⚠️ Content flagged: {safety_message}"
-                        response = "[This content was flagged by moderation and not sent to the AI. Please try again.]"
-
-                        span.set_attribute("feedback", feedback)
-
-                        return response, past_messages, feedback
-
-                    # Content safe - add to prompt
-                    prompt_parts.append(value)
-
-                # MODERATION STEP 2: Check media files
-                elif key == "files" and value:
-
-                    for file_path in value:
-
-                        try:
-
-                            # Call moderation backend (FastAPI service)
-                            is_safe, safety_message, mime_type = check_content_safety(media=file_path)
-
-                            if not is_safe:
-                                # Content flagged - block and return error
-                                feedback = f"⚠️ Content flagged: {safety_message}"
-                                response = (
-                                    "[This content was flagged by moderation and not sent to the AI. Please try again.]"
-                                )
-
-                                return response, past_messages, feedback
-
-                            # Content safe - read file and add to prompt
-                            with open(file_path, "rb") as f:
-                                file_bytes = f.read()
-                            
-                            prompt_parts.append(
-                                BinaryContent(data=file_bytes, media_type=mime_type)
-                            )
-
-                        except ValueError as e:
-                            raise gr.Error(str(e))
-
-            if not prompt_parts:
+            # The leading "next message from the support agent" string is always present,
+            # so a length of 1 means the trainee submitted nothing actionable.
+            if len(outcome.prompt_parts) <= 1:
                 raise gr.Error("Please provide a message or at least one file.")
 
-            # All content passed moderation - send to AI customer
-            try:
-                with tracer.start_as_current_span("llm_customer"):
+            # 3. All content passed moderation - forward to the customer-role agent.
+            response_text, updated_messages = await _run_customer_agent(
+                outcome.prompt_parts, past_messages
+            )
 
-                    # GEMINI CALL: Send prompt to AI agent that plays the customer role
-                    result = await customer_agent.run(
-                        prompt_parts,
-                        message_history=past_messages,
-                    )
+            # Record the (non-flagged) moderation feedback for this turn as well,
+            # so the "feedback" span exists on every chat turn, not only failures.
+            _emit_feedback_span(outcome.safety_message, flagged=False)
 
-                logger.info(f"Response generated ({len(result.all_messages())} messages in history)")
-                return result.output, result.all_messages(), safety_message
-
-            except Exception as e:
-                logger.error(f"Error in chat_with_gemini: {str(e)}")
-                raise gr.Error(
-                    f"I'm sorry, but I encountered an error while processing your request. "
-                    f"Please try again or contact ACME support if the issue persists."
-                )
+            return response_text, updated_messages, outcome.safety_message
 
     def end_conversation(self):
         """

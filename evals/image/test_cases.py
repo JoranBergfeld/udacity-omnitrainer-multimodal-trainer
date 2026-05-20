@@ -96,6 +96,7 @@ cases: List[Case[List[ImageInput], ImageModerationResult, Any]] = [
 
 
 image_dataset = Dataset[List[ImageInput], ImageModerationResult, Any](
+    name="image_moderation",
     cases=create_repeated_cases(cases),
     evaluators=[
         IsInstance(type_name="ImageModerationResult"),

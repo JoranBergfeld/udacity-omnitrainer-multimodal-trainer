@@ -75,6 +75,7 @@ cases: List[Case[List[VideoInput], VideoModerationResult, Any]] = [
 
 
 video_dataset = Dataset[List[VideoInput], VideoModerationResult, Any](
+    name="video_moderation",
     cases=create_repeated_cases(cases),
     evaluators=[
         IsInstance(type_name="VideoModerationResult"),

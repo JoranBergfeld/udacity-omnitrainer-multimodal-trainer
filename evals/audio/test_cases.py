@@ -75,6 +75,7 @@ cases: List[Case[List[AudioInput], AudioModerationResult, Any]] = [
 
 
 audio_dataset = Dataset[List[AudioInput], AudioModerationResult, Any](
+    name="audio_moderation",
     cases=create_repeated_cases(cases),
     evaluators=[
         IsInstance(type_name="AudioModerationResult"),

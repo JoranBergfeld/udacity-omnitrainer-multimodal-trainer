@@ -135,8 +135,8 @@ cases: List[Case[List[TextInput], TextModerationResult, Any]] = [
 
 # Create the dataset with all test cases
 # create_repeated_cases() repeats each case EVAL_NUM_REPEATS times to measure consistency
-text_dataset = Dataset[List[TextInput], TextModerationResult, Any](\
-
+text_dataset = Dataset[List[TextInput], TextModerationResult, Any](
+    name="text_moderation",
     cases=create_repeated_cases(cases),
     evaluators=[
         # Global evaluators that apply to all test cases
